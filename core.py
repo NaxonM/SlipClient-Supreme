@@ -96,24 +96,12 @@ def build_client_cmd(cfg: dict, resolvers: list[str], listen_port: int) -> list[
         cmd += ["--cert", cfg["cert_path"]]
 
     sup = _client_supported_flags()
-    cc = (cfg.get("congestion_control") or "").strip().lower()
-    if cc:
-        if "--congestion-control" in sup:
-            cmd += ["--congestion-control", cc]
-        elif "--quic-congestion-control" in sup:
-            cmd += ["--quic-congestion-control", cc]
 
     if cfg.get("authoritative_mode"):
         if "--authoritative" in sup:
             cmd += ["--authoritative"]
         elif "--authoritative-mode" in sup:
             cmd += ["--authoritative-mode"]
-
-    if cfg.get("gso_enabled"):
-        if "--gso" in sup:
-            cmd += ["--gso"]
-        elif "--enable-gso" in sup:
-            cmd += ["--enable-gso"]
 
     return cmd
 
@@ -249,10 +237,9 @@ DEFAULT_CFG = {
     "http_proxy_port":          8080,      # our HTTP→SOCKS bridge
     "cert_path":                "",
     "keep_alive_ms":            400,
-    # Slipstream client tuning (applied only if binary supports the flags)
-    "congestion_control":       "",
     "authoritative_mode":       False,
-    "gso_enabled":              False,
+    # Python-side socket tuning (applies regardless of client binary flags)
+    "low_latency_mode":         True,
     # SOCKS5 auth (tunnel server side)
     "socks_auth":               False,
     "socks_user":               "",
@@ -268,6 +255,8 @@ DEFAULT_CFG = {
     "scan_workers":             4000,
     "scan_timeout":             "1s",
     "scan_threshold":           50,
+    "scan_burst_count":         10,
+    "monitor_refresh_sec":      1,
     # Watchdog
     "watchdog_enabled":         False,
     "watchdog_check_interval":  60,
@@ -294,6 +283,20 @@ DEFAULT_CFG = {
     # Multi-instance failover depth (extra resolvers after the primary)
     "instance_failover_count":  1,
 }
+
+
+def _tune_tcp_socket(sock: socket.socket, cfg: dict):
+    """Best-effort Python-side latency/stability tuning for local proxy sockets."""
+    if not cfg.get("low_latency_mode", True):
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROFILE I/O
@@ -1286,6 +1289,20 @@ def auto_scan_mode(profile_name: str, reason: str = "manual") -> str:
     return "fast"
 
 
+
+
+def _burst_dns_success(ip: str, domain: str, timeout: float, count: int = 10) -> float:
+    """Return success ratio for repeated randomized DNS tunnel queries."""
+    if count <= 0:
+        return 1.0
+    ok = 0
+    for _ in range(count):
+        q = f"{''.join(random.choice('abcdefghijklmnopqrstuvwxyz0123456789') for _ in range(8))}.{domain}"
+        passed, _, _ = _dns_udp_query(ip, q, 1, timeout)
+        if passed:
+            ok += 1
+    return ok / float(count)
+
 def run_dnscan(cfg: dict, profile_name: str,
                mode: str = None,
                output: Path = None,
@@ -1340,6 +1357,20 @@ def run_dnscan(cfg: dict, profile_name: str,
             ip = line.strip()
             if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
                 results.append(ip)
+
+    # Post-filter with SlipNet-like burst sampling to reduce false positives.
+    burst_n = int(cfg.get("scan_burst_count", 10) or 0)
+    if results and burst_n > 0:
+        kept = []
+        for ip in results:
+            rate = _burst_dns_success(ip, cfg["domain"], timeout=1.2, count=burst_n)
+            update_qps(profile_name, ip, rate)
+            if rate >= 0.4:
+                kept.append(ip)
+            elif progress_cb:
+                progress_cb(f"[burst-filter] reject {ip} ({int(rate*100)}%)")
+        results = kept
+
     return results
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1765,9 +1796,11 @@ def _relay(a, b, active_port=0):
             except Exception: pass
 
 
-def _proxy_handle(sock, base_port, user, passwd, connect_timeout=20):
+def _proxy_handle(sock, base_port, user, passwd, connect_timeout=20, cfg: dict | None = None):
     try:
         sock.settimeout(10)
+        if cfg:
+            _tune_tcp_socket(sock, cfg)
         buf = b""
         while b"\r\n\r\n" not in buf:
             c = sock.recv(4096)
@@ -1783,6 +1816,8 @@ def _proxy_handle(sock, base_port, user, passwd, connect_timeout=20):
                 up = _socks5_open("127.0.0.1", sp, host, port,
                                   user or None, passwd,
                                   timeout=connect_timeout)
+                if cfg:
+                    _tune_tcp_socket(up, cfg)
             except Exception as e:
                 sock.sendall(f"HTTP/1.1 502 Bad Gateway\r\nX-Err: {e}\r\n\r\n".encode())
                 return
@@ -1797,6 +1832,8 @@ def _proxy_handle(sock, base_port, user, passwd, connect_timeout=20):
                 up = _socks5_open("127.0.0.1", sp, host, port,
                                   user or None, passwd,
                                   timeout=connect_timeout)
+                if cfg:
+                    _tune_tcp_socket(up, cfg)
             except Exception:
                 sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n"); return
             up.sendall(buf)
@@ -1807,7 +1844,7 @@ def _proxy_handle(sock, base_port, user, passwd, connect_timeout=20):
         except Exception: pass
 
 
-def _proxy_loop(http_port, base_port, user, passwd, connect_timeout):
+def _proxy_loop(http_port, base_port, user, passwd, connect_timeout, cfg):
     global _proxy_srv
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1821,7 +1858,7 @@ def _proxy_loop(http_port, base_port, user, passwd, connect_timeout):
         try:
             c, _ = srv.accept()
             threading.Thread(target=_proxy_handle,
-                             args=(c, base_port, user, passwd, connect_timeout),
+                             args=(c, base_port, user, passwd, connect_timeout, cfg),
                              daemon=True).start()
         except socket.timeout: continue
         except Exception: break
@@ -1837,7 +1874,7 @@ def start_proxy(cfg: dict):
     ct     = cfg.get("watchdog_probe_timeout", 12) + 5
     _proxy_thread = threading.Thread(
         target=_proxy_loop,
-        args=(cfg["http_proxy_port"], base, user, passwd, ct),
+        args=(cfg["http_proxy_port"], base, user, passwd, ct, cfg),
         daemon=True,
     )
     _proxy_thread.start()
@@ -2128,9 +2165,10 @@ def _watchdog_loop(profile_name: str):
 
             if time.monotonic() - last_scan >= cfg["watchdog_scan_interval"]:
                 flog(profile_name, "watchdog", "Periodic rescan")
-                _do_scan(profile_name, cfg, "periodic")
+                periodic_new = _do_scan(profile_name, cfg, "periodic")
                 last_scan = time.monotonic()
-                restart_tunnel(cfg, profile_name)
+                if periodic_new:
+                    restart_tunnel(cfg, profile_name)
         except Exception as e:
             flog(profile_name, "watchdog", f"Loop error: {e}")
             time.sleep(1)

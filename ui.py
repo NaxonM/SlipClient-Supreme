@@ -273,9 +273,6 @@ def run_scan_interactive(profile_name: str, cfg: dict,
 
     print(f"\n  {_c(len(candidates), BO)} candidate(s) passed dnscan benchmark.")
 
-    if platform.system() != "Windows":
-        return candidates
-
     if skip_verify_prompt:
         return candidates
 
@@ -475,6 +472,41 @@ def menu_health(profile_name: str, cfg: dict):
     core.flog(profile_name, "health", f"Health check: {alive}/{len(servers)} alive")
     pause()
 
+
+
+def verify_existing_pool(profile_name: str, cfg: dict):
+    servers = core.load_servers(profile_name)
+    if not servers:
+        warn("Resolver pool is empty.")
+        return
+    workers = cfg.get("verify_workers", 4)
+    print()
+    info(f"E2E-verifying {len(servers)} resolver(s) with {workers} worker(s)...")
+    passed = []
+    failed = []
+
+    def _cb(ip, ok_pass):
+        if ok_pass:
+            passed.append(ip)
+            print(f"  {_c('✓', G, BO)} {ip}")
+        else:
+            failed.append(ip)
+            print(f"  {_c('✗', Y, BO)} {ip}")
+
+    core.verify_resolvers_parallel(
+        servers, cfg,
+        profile_name=profile_name,
+        max_workers=workers,
+        result_cb=_cb,
+    )
+
+    print()
+    ok(f"E2E pass: {len(passed)} / {len(servers)}")
+    if failed and ask_bool(f"Remove {len(failed)} failed resolver(s) from pool?", default=False):
+        left = [ip for ip in servers if ip not in set(failed)]
+        core.save_servers(profile_name, left)
+        ok(f"Removed {len(failed)} resolver(s). {len(left)} remain.")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MENU: RESOLVER POOL  (#1 scores display, #5 cap, #12 export)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,6 +545,7 @@ def menu_resolvers(profile_name: str, cfg: dict):
         print(f"  {_c('c',C)})  Clear pool")
         print(f"  {_c('e',C)})  Open in Notepad")
         print(f"  {_c('x',C)})  Export as slipnet:// URI  (share with others)")
+        print(f"  {_c('v',C)})  E2E verify pool  (prompt to remove failures)")
         print(f"  {_c('0',DIM)})  Back")
         print()
 
@@ -548,6 +581,9 @@ def menu_resolvers(profile_name: str, cfg: dict):
             if core.tunnel_running() and core._running_prof == profile_name:
                 core.restart_tunnel(cfg, profile_name); ok("Tunnel reloaded")
             pause()
+        elif choice == "v":
+            verify_existing_pool(profile_name, cfg)
+            pause()
         elif choice == "x":
             # #12: Export slipnet:// URI
             if not servers:
@@ -576,15 +612,14 @@ def menu_configure(profile_name: str, cfg: dict):
     cfg["keep_alive_ms"] = ask_int("Keep-alive interval ms", cfg.get("keep_alive_ms",400), 50, 10000)
 
     print(f"\n  {_c('Slipstream Engine',BO)}\n")
-    cfg["congestion_control"] = ask(
-        "Congestion control  (blank/BBR/DCUBIC)",
-        cfg.get("congestion_control", ""))
     cfg["authoritative_mode"] = ask_bool(
         "Authoritative mode?",
         bool(cfg.get("authoritative_mode", False)))
-    cfg["gso_enabled"] = ask_bool(
-        "Enable GSO if supported by binary?",
-        bool(cfg.get("gso_enabled", False)))
+
+    print(f"\n  {_c('Python Socket Tuning',BO)}  {_c('(client-binary independent)',DIM)}\n")
+    cfg["low_latency_mode"] = ask_bool(
+        "Enable low-latency socket tuning (TCP_NODELAY + keepalive)?",
+        bool(cfg.get("low_latency_mode", True)))
 
     print(f"\n  {_c('Adaptive Keep-Alive',BO)}  "
           f"{_c('(auto-adjusts keep-alive based on tunnel health)',DIM)}\n")
@@ -665,6 +700,9 @@ def menu_configure(profile_name: str, cfg: dict):
     cfg["verify_relaxed_count"] = ask_int(
         "Relaxed retry count",
         cfg.get("verify_relaxed_count", 6), 1, 40)
+    cfg["monitor_refresh_sec"] = ask_int(
+        "Live monitor refresh interval (s)",
+        cfg.get("monitor_refresh_sec", 1), 1, 10)
 
     core.save_cfg(profile_name, cfg)
     print(); ok("Configuration saved.")
@@ -1076,28 +1114,30 @@ def menu_profiles(active: str) -> str:
             warn("Invalid choice."); time.sleep(0.5)
 
 def menu_live_monitor(profile_name: str, cfg: dict):
-    """Live runtime dashboard. Ctrl+C to return."""
-    try:
-        while True:
-            clr()
-            section(f"Live Monitor  ·  {profile_name}")
-            st = core.tunnel_runtime_stats(profile_name)
-            conn = pill("CONNECTED", G) if st["connected"] else pill("DISCONNECTED", R)
-            lat = f"{st['active_latency_ms']} ms" if st.get("active_latency_ms") is not None else "-"
-            print(f"  Status           {conn}")
-            print(f"  Download         {_c(fmt_rate(st['down_bps']), G, BO)}")
-            print(f"  Upload           {_c(fmt_rate(st['up_bps']), C, BO)}")
-            print(f"  Total Download   {_c(fmt_bytes(st['total_down']), BO)}")
-            print(f"  Total Upload     {_c(fmt_bytes(st['total_up']), BO)}")
-            print(f"  Active port      {_c(st.get('active_port') or '-', BO)}")
-            print(f"  Active resolver  {_c(st.get('active_resolver') or '-', BO)}")
-            print(f"  Resolver latency {_c(lat, BO)}")
-            print(f"  Connections      {_c(st.get('total_conns', 0), BO)}")
-            print() 
-            print(f"  {_c('Ctrl+C to return', DIM)}")
-            time.sleep(1)
-    except KeyboardInterrupt:
-        return
+    """Live runtime dashboard. Press q + Enter to return."""
+    refresh = max(1, int(cfg.get("monitor_refresh_sec", 1)))
+    while True:
+        clr()
+        section(f"Live Monitor  ·  {profile_name}")
+        st = core.tunnel_runtime_stats(profile_name)
+        conn = pill("CONNECTED", G) if st["connected"] else pill("DISCONNECTED", R)
+        lat = f"{st['active_latency_ms']} ms" if st.get("active_latency_ms") is not None else "-"
+        print(f"  Status           {conn}")
+        print(f"  Download         {_c(fmt_rate(st['down_bps']), G, BO)}")
+        print(f"  Upload           {_c(fmt_rate(st['up_bps']), C, BO)}")
+        print(f"  Total Download   {_c(fmt_bytes(st['total_down']), BO)}")
+        print(f"  Total Upload     {_c(fmt_bytes(st['total_up']), BO)}")
+        print(f"  Active port      {_c(st.get('active_port') or '-', BO)}")
+        print(f"  Active resolver  {_c(st.get('active_resolver') or '-', BO)}")
+        print(f"  Resolver latency {_c(lat, BO)}")
+        print(f"  Connections      {_c(st.get('total_conns', 0), BO)}")
+        print()
+        print(f"  {_c(f'Auto-refresh: every {refresh}s', DIM)}")
+        cmd = input(f"  {_c('Press Enter to refresh or type q to return:', DIM)} ").strip().lower()
+        if cmd == 'q':
+            return
+        time.sleep(refresh)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
