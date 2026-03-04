@@ -39,6 +39,7 @@ Then restart the app. The app now runs a startup diagnostic and warns when this 
 From main menu:
 - `y` toggles system proxy on/off immediately.
 - `u` restores previously captured proxy defaults.
+- Header auto-refreshes so live down/up/latency counters update continuously.
 
 This works without stopping the tunnel process.
 
@@ -54,6 +55,7 @@ To reduce risk of broken network settings:
 These defaults are tuned for lower resource usage while preserving throughput:
 - `scan_workers`: 1200
 - `monitor_refresh_sec`: 2
+- `header_refresh_sec`: 2
 - `verify_workers`: 4
 - `multi_instance`: 1–2 for most systems
 
@@ -79,6 +81,7 @@ Recommended flow:
 2. If empty/weak results, use `fast`, then `medium`.
 3. Keep E2E verification enabled.
 4. Use resolver pool verify action (`v`) periodically and remove failed resolvers.
+5. Configure how many candidates are E2E-verified (`verify_sample_count`) based on your speed/quality preference.
 
 The app additionally applies burst post-filtering to reduce false positives.
 

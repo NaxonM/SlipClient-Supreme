@@ -56,3 +56,6 @@
 - Refined defaults to reduce resource usage spikes (`scan_workers` lowered to 1200, monitor refresh to 2s).
 - Expanded input validation in UI (domain, timeout, URL, country code) to reduce bad config states.
 - Added complete user-facing guide in `docs/USER_GUIDE.md`.
+- Expanded UI runtime module to include timed menu input + auto-refresh monitor mechanics, and moved candidate verification flow into resolver maintenance module to reduce `ui.py` size further.
+- Monitor latency display now rounds to integer milliseconds for readability.
+- Added configurable `verify_sample_count` and `header_refresh_sec` defaults to improve scan-quality control and header responsiveness.

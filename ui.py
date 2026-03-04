@@ -159,8 +159,7 @@ def print_header(active: str, cfg: dict):
     print(f"  {_status_bar(cfg)}")
     if core.tunnel_running():
         snap = ui_runtime.runtime_snapshot(core, active)
-        lat = f"{snap['active_latency_ms']}ms" if snap.get('active_latency_ms') is not None else "-"
-        print(f"  {_c('Live', DIM)}  down={_c(fmt_rate(snap['down_bps']), G)}  up={_c(fmt_rate(snap['up_bps']), C)}  lat={_c(lat, BO)}  conns={_c(snap['total_conns'], BO)}")
+        print(ui_runtime.render_live_strip({"_c": _c, "fmt_rate": fmt_rate, "colors": {"G": G, "C": C, "BO": BO, "DIM": DIM}}, snap))
     hr(); print()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -314,78 +313,18 @@ def run_scan_interactive(profile_name: str, cfg: dict,
     if skip_verify_prompt:
         return candidates
 
-    n_test   = min(len(candidates), 20)
-    workers  = cfg.get("verify_workers", 4)
-    eta_s    = max(8, (n_test // workers + 1) * 8)
-    print()
-    do_verify = ask_bool(
-        f"Tunnel-verify top {n_test} candidate(s)?  "
-        f"(~{eta_s}s with {workers} parallel workers — confirms actual tunnel + hijack check)",
-        default=True)
-
-    if not do_verify:
-        warn(f"Skipping verification — using all {len(candidates)} candidates unverified.")
-        return candidates
-
-    print()
-    print(f"  {_c('━'*54, C)}")
-    print(f"  {_c('  TUNNEL VERIFICATION', C, BO)}")
-    print(f"  {_c('━'*54, C)}")
-    print(f"  {_c(n_test, BO)} candidates  ·  "
-          f"{_c(workers, BO)} parallel workers  ·  "
-          f"~{_c(eta_s, BO)}s estimated")
-    print(f"  {_c('Each IP: spawns client → waits for SOCKS5 → probes tunnel → DNS hijack check', DIM)}")
-    print(f"  {_c('━'*54, C)}")
-    print()
-
-    # #3: Parallel streaming verify with #9 integrity results
-    verified    = []
-    result_lock = threading.Lock()
-    counter     = [0]
-
-    def _cb(ip, passed):
-        with result_lock:
-            counter[0] += 1
-            i = counter[0]
-            if passed:
-                mark = f"  {_c('✓  PASS', G, BO)}"
-                verified.append(ip)
-            else:
-                scores = core.load_scores(profile_name)
-                if scores.get(ip, {}).get("hijacked"):
-                    mark = f"  {_c('✗  HIJACKED', R, BO)}"
-                else:
-                    mark = f"  {_c('✗  fail', DIM)}"
-            sys.stdout.write(f"\r  {_c(f'[{i}/{n_test}]', C, BO)}  {ip:<22}{mark}   \n")
-            sys.stdout.flush()
-
-    # Print a "waiting" line before kicking off so screen isn't blank
-    sys.stdout.write(f"  {_c('Starting workers…', DIM)}")
-    sys.stdout.flush()
-
-    core.verify_resolvers_parallel(
-        candidates[:n_test], cfg,
-        profile_name=profile_name,
-        max_workers=workers,
-        result_cb=_cb,
+    return ui_resolver_maintenance.verify_candidates_interactive(
+        core,
+        profile_name,
+        cfg,
+        candidates,
+        {
+            "ask_bool": ask_bool,
+            "warn": warn,
+            "_c": _c,
+            "colors": {"G": G, "Y": Y, "R": R, "C": C, "BO": BO, "DIM": DIM},
+        },
     )
-
-    print()
-    print(f"  {_c('━'*54, C)}")
-    color = G if verified else Y
-    total_tested = min(n_test, len(candidates))
-    print(f"  Result: {_c(len(verified), color, BO)} / {total_tested} passed")
-    print(f"  {_c('━'*54, C)}")
-
-    if not verified:
-        print()
-        warn("All verifications failed — this usually means the tunnel server is")
-        warn("unreachable or the domain is wrong, NOT that the resolvers are bad.")
-        warn("Falling back to unverified candidates so you can still start the tunnel.")
-        print(f"  {_c('Tip:', DIM)} Check your domain and server, then re-scan.")
-        return candidates
-
-    return verified
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MENU: SCAN
@@ -697,6 +636,9 @@ def menu_configure(profile_name: str, cfg: dict):
     cfg["verify_timeout"] = ask_int(
         "Verify timeout (s)",
         cfg.get("verify_timeout", 14), 4, 60)
+    cfg["verify_sample_count"] = ask_int(
+        "How many scan candidates to E2E verify",
+        cfg.get("verify_sample_count", 20), 1, 500)
     cfg["watchdog_probe_mode"] = ask(
         "Watchdog probe mode (auto/http/socks)",
         cfg.get("watchdog_probe_mode", "auto")).lower() or "auto"
@@ -711,7 +653,10 @@ def menu_configure(profile_name: str, cfg: dict):
         cfg.get("verify_relaxed_count", 6), 1, 40)
     cfg["monitor_refresh_sec"] = ask_int(
         "Live monitor refresh interval (s)",
-        cfg.get("monitor_refresh_sec", 1), 1, 10)
+        cfg.get("monitor_refresh_sec", 2), 1, 10)
+    cfg["header_refresh_sec"] = ask_int(
+        "Main header auto-refresh interval (s)",
+        cfg.get("header_refresh_sec", 2), 1, 10)
 
     core.save_cfg(profile_name, cfg)
     print(); ok("Configuration saved.")
@@ -1035,6 +980,9 @@ def wizard(default_active: str = None) -> str | None:
     cfg["scan_workers"]   = ask_int("Workers", 1200, 100, 16000)
     cfg["scan_timeout"]   = ask_timeout_str("Timeout", "1s")
     cfg["scan_threshold"] = ask_int("Benchmark threshold %", 50, 1, 100)
+    cfg["verify_sample_count"] = ask_int("E2E verify top N candidates", 20, 1, 500)
+    cfg["monitor_refresh_sec"] = ask_int("Live monitor refresh (s)", 2, 1, 10)
+    cfg["header_refresh_sec"] = ask_int("Main header refresh (s)", 2, 1, 10)
     core.save_cfg(name, cfg)
 
     if ask_bool("Scan for resolvers now?", True):
@@ -1171,7 +1119,15 @@ def main_menu(start_profile: str = None):
         print(f"  {_c('0',DIM)})  Exit")
         print()
 
-        raw_choice = input(f"  {_c('>',C,BO)} ").strip().lower()
+        raw_choice = ui_runtime.timed_menu_choice(
+            f"  {_c('>',C,BO)} ",
+            float(max(1, int(cfg.get("header_refresh_sec", 2))))
+        )
+        if raw_choice is None:
+            continue
+        raw_choice = raw_choice.strip().lower()
+        if not raw_choice:
+            continue
         aliases = {"start":"t","stop":"t","restart":"r","scan":"s","health":"h","resolvers":"l","watchdog":"w","profiles":"p","config":"c","monitor":"m","logs":"g","proxy":"y","toggle-proxy":"y","restore-proxy":"u","exit":"0","quit":"0"}
         choice = aliases.get(raw_choice, raw_choice)
 

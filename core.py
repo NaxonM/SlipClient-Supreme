@@ -280,6 +280,7 @@ DEFAULT_CFG = {
     "scan_threshold":           50,
     "scan_burst_count":         10,
     "monitor_refresh_sec":      2,
+    "header_refresh_sec":       2,
     # Watchdog
     "watchdog_enabled":         False,
     "watchdog_check_interval":  60,
@@ -299,6 +300,7 @@ DEFAULT_CFG = {
     # Verification parallelism  (#3)
     "verify_workers":           4,
     "verify_timeout":           14,
+    "verify_sample_count":      20,
     "verify_relaxed_retry":     True,
     "verify_relaxed_count":     6,
     "verify_probe_host":        "example.com",
