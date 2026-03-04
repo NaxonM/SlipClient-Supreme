@@ -12,6 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import core
+import ui_runtime
+import ui_resolver_maintenance
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COLORS
@@ -61,6 +63,38 @@ def ask_int(prompt: str, default: int, lo: int = 1, hi: int = 9999) -> int:
             if lo <= v <= hi: return v
         except ValueError: pass
         print(f"  {_c(f'Enter a number {lo}–{hi}', Y)}")
+
+
+def ask_domain(prompt: str, default: str = "") -> str:
+    while True:
+        v = ask(prompt, default).strip().lower()
+        if re.match(r"^(?=.{3,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$", v):
+            return v
+        warn("Invalid domain format (example: t.example.com).")
+
+
+def ask_timeout_str(prompt: str, default: str = "1s") -> str:
+    while True:
+        v = ask(prompt, default).strip().lower()
+        if re.match(r"^\d+(ms|s)$", v):
+            return v
+        warn("Timeout must be like 800ms or 2s.")
+
+
+def ask_url_http(prompt: str, default: str) -> str:
+    while True:
+        v = ask(prompt, default).strip()
+        if re.match(r"^https?://[^\s/$.?#].[^\s]*$", v):
+            return v
+        warn("Invalid URL. Example: http://1.1.1.1")
+
+
+def ask_country_code(prompt: str, default: str = "ir") -> str:
+    while True:
+        v = ask(prompt, default).strip().lower()
+        if re.match(r"^[a-z]{2}$", v):
+            return v
+        warn("Country code must be 2 letters (e.g. ir, cn, ru).")
 
 
 def fmt_rate(bps: float) -> str:
@@ -273,84 +307,21 @@ def run_scan_interactive(profile_name: str, cfg: dict,
 
     print(f"\n  {_c(len(candidates), BO)} candidate(s) passed dnscan benchmark.")
 
-    if platform.system() != "Windows":
-        return candidates
-
     if skip_verify_prompt:
         return candidates
 
-    n_test   = min(len(candidates), 20)
-    workers  = cfg.get("verify_workers", 4)
-    eta_s    = max(8, (n_test // workers + 1) * 8)
-    print()
-    do_verify = ask_bool(
-        f"Tunnel-verify top {n_test} candidate(s)?  "
-        f"(~{eta_s}s with {workers} parallel workers — confirms actual tunnel + hijack check)",
-        default=True)
-
-    if not do_verify:
-        warn(f"Skipping verification — using all {len(candidates)} candidates unverified.")
-        return candidates
-
-    print()
-    print(f"  {_c('━'*54, C)}")
-    print(f"  {_c('  TUNNEL VERIFICATION', C, BO)}")
-    print(f"  {_c('━'*54, C)}")
-    print(f"  {_c(n_test, BO)} candidates  ·  "
-          f"{_c(workers, BO)} parallel workers  ·  "
-          f"~{_c(eta_s, BO)}s estimated")
-    print(f"  {_c('Each IP: spawns client → waits for SOCKS5 → probes tunnel → DNS hijack check', DIM)}")
-    print(f"  {_c('━'*54, C)}")
-    print()
-
-    # #3: Parallel streaming verify with #9 integrity results
-    verified    = []
-    result_lock = threading.Lock()
-    counter     = [0]
-
-    def _cb(ip, passed):
-        with result_lock:
-            counter[0] += 1
-            i = counter[0]
-            if passed:
-                mark = f"  {_c('✓  PASS', G, BO)}"
-                verified.append(ip)
-            else:
-                scores = core.load_scores(profile_name)
-                if scores.get(ip, {}).get("hijacked"):
-                    mark = f"  {_c('✗  HIJACKED', R, BO)}"
-                else:
-                    mark = f"  {_c('✗  fail', DIM)}"
-            sys.stdout.write(f"\r  {_c(f'[{i}/{n_test}]', C, BO)}  {ip:<22}{mark}   \n")
-            sys.stdout.flush()
-
-    # Print a "waiting" line before kicking off so screen isn't blank
-    sys.stdout.write(f"  {_c('Starting workers…', DIM)}")
-    sys.stdout.flush()
-
-    core.verify_resolvers_parallel(
-        candidates[:n_test], cfg,
-        profile_name=profile_name,
-        max_workers=workers,
-        result_cb=_cb,
+    return ui_resolver_maintenance.verify_candidates_interactive(
+        core,
+        profile_name,
+        cfg,
+        candidates,
+        {
+            "ask_bool": ask_bool,
+            "warn": warn,
+            "_c": _c,
+            "colors": {"G": G, "Y": Y, "R": R, "C": C, "BO": BO, "DIM": DIM},
+        },
     )
-
-    print()
-    print(f"  {_c('━'*54, C)}")
-    color = G if verified else Y
-    total_tested = min(n_test, len(candidates))
-    print(f"  Result: {_c(len(verified), color, BO)} / {total_tested} passed")
-    print(f"  {_c('━'*54, C)}")
-
-    if not verified:
-        print()
-        warn("All verifications failed — this usually means the tunnel server is")
-        warn("unreachable or the domain is wrong, NOT that the resolvers are bad.")
-        warn("Falling back to unverified candidates so you can still start the tunnel.")
-        print(f"  {_c('Tip:', DIM)} Check your domain and server, then re-scan.")
-        return candidates
-
-    return verified
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MENU: SCAN
@@ -370,7 +341,7 @@ def menu_scan(profile_name: str, cfg: dict):
 
     cfg["scan_mode"]      = ask("Mode",               cfg["scan_mode"])
     cfg["scan_workers"]   = ask_int("Workers",         cfg["scan_workers"], 100, 16000)
-    cfg["scan_timeout"]   = ask("Timeout  (e.g. 1s)", cfg["scan_timeout"])
+    cfg["scan_timeout"]   = ask_timeout_str("Timeout  (e.g. 1s)", cfg["scan_timeout"])
     cfg["scan_threshold"] = ask_int("Benchmark threshold %", cfg["scan_threshold"], 1, 100)
     core.save_cfg(profile_name, cfg)
 
@@ -475,6 +446,9 @@ def menu_health(profile_name: str, cfg: dict):
     core.flog(profile_name, "health", f"Health check: {alive}/{len(servers)} alive")
     pause()
 
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MENU: RESOLVER POOL  (#1 scores display, #5 cap, #12 export)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,6 +487,7 @@ def menu_resolvers(profile_name: str, cfg: dict):
         print(f"  {_c('c',C)})  Clear pool")
         print(f"  {_c('e',C)})  Open in Notepad")
         print(f"  {_c('x',C)})  Export as slipnet:// URI  (share with others)")
+        print(f"  {_c('v',C)})  E2E verify pool  (prompt to remove failures)")
         print(f"  {_c('0',DIM)})  Back")
         print()
 
@@ -548,6 +523,12 @@ def menu_resolvers(profile_name: str, cfg: dict):
             if core.tunnel_running() and core._running_prof == profile_name:
                 core.restart_tunnel(cfg, profile_name); ok("Tunnel reloaded")
             pause()
+        elif choice == "v":
+            ui_resolver_maintenance.verify_existing_pool(core, profile_name, cfg, {
+                "warn": warn, "info": info, "ok": ok, "ask_bool": ask_bool,
+                "_c": _c, "colors": {"G": G, "Y": Y, "BO": BO}
+            })
+            pause()
         elif choice == "x":
             # #12: Export slipnet:// URI
             if not servers:
@@ -571,20 +552,19 @@ def menu_configure(profile_name: str, cfg: dict):
     section(f"Configure  ·  {profile_name}")
 
     print(f"  {_c('Tunnel Server',BO)}\n")
-    cfg["domain"]        = ask("Tunnel domain",              cfg["domain"])
+    cfg["domain"]        = ask_domain("Tunnel domain",              cfg["domain"])
     cfg["cert_path"]     = ask("Cert path  (blank = none)",  cfg.get("cert_path",""))
     cfg["keep_alive_ms"] = ask_int("Keep-alive interval ms", cfg.get("keep_alive_ms",400), 50, 10000)
 
     print(f"\n  {_c('Slipstream Engine',BO)}\n")
-    cfg["congestion_control"] = ask(
-        "Congestion control  (blank/BBR/DCUBIC)",
-        cfg.get("congestion_control", ""))
     cfg["authoritative_mode"] = ask_bool(
         "Authoritative mode?",
         bool(cfg.get("authoritative_mode", False)))
-    cfg["gso_enabled"] = ask_bool(
-        "Enable GSO if supported by binary?",
-        bool(cfg.get("gso_enabled", False)))
+
+    print(f"\n  {_c('Python Socket Tuning',BO)}  {_c('(client-binary independent)',DIM)}\n")
+    cfg["low_latency_mode"] = ask_bool(
+        "Enable low-latency socket tuning (TCP_NODELAY + keepalive)?",
+        bool(cfg.get("low_latency_mode", True)))
 
     print(f"\n  {_c('Adaptive Keep-Alive',BO)}  "
           f"{_c('(auto-adjusts keep-alive based on tunnel health)',DIM)}\n")
@@ -641,18 +621,26 @@ def menu_configure(profile_name: str, cfg: dict):
         cfg.get("resolver_max_age_days", 7), 0, 365)
 
     print(f"\n  {_c('Scan Defaults',BO)}\n")
-    cfg["country"]        = ask("Country code  (ir, cn, ru...)",  cfg["country"])
+    cfg["country"]        = ask_country_code("Country code  (ir, cn, ru...)",  cfg["country"])
     cfg["scan_mode"]      = ask("Default scan mode",              cfg["scan_mode"])
     cfg["scan_workers"]   = ask_int("Default workers",            cfg["scan_workers"], 100, 16000)
-    cfg["scan_timeout"]   = ask("Default timeout  (e.g. 1s)",    cfg["scan_timeout"])
+    cfg["scan_timeout"]   = ask_timeout_str("Default timeout  (e.g. 1s)",    cfg["scan_timeout"])
     cfg["scan_threshold"] = ask_int("Default benchmark threshold%",
                                      cfg["scan_threshold"], 1, 100)
+    cfg["scan_burst_count"] = ask_int("Burst filter query count", cfg.get("scan_burst_count", 6), 0, 30)
+    cfg["scan_burst_workers"] = ask_int("Burst filter workers", cfg.get("scan_burst_workers", 64), 1, 512)
     cfg["verify_workers"] = ask_int(
         "Parallel verify workers  (4 recommended)",
         cfg.get("verify_workers", 4), 1, 16)
     cfg["verify_timeout"] = ask_int(
         "Verify timeout (s)",
         cfg.get("verify_timeout", 14), 4, 60)
+    cfg["verify_sample_count"] = ask_int(
+        "How many scan candidates to E2E verify",
+        cfg.get("verify_sample_count", 20), 1, 500)
+    cfg["dns_precheck_mode"] = ask(
+        "DNS precheck mode (quick/full)",
+        cfg.get("dns_precheck_mode", "quick")).lower() or "quick"
     cfg["watchdog_probe_mode"] = ask(
         "Watchdog probe mode (auto/http/socks)",
         cfg.get("watchdog_probe_mode", "auto")).lower() or "auto"
@@ -665,6 +653,9 @@ def menu_configure(profile_name: str, cfg: dict):
     cfg["verify_relaxed_count"] = ask_int(
         "Relaxed retry count",
         cfg.get("verify_relaxed_count", 6), 1, 40)
+    cfg["monitor_refresh_sec"] = ask_int(
+        "Live monitor refresh interval (s)",
+        cfg.get("monitor_refresh_sec", 2), 1, 10)
 
     core.save_cfg(profile_name, cfg)
     print(); ok("Configuration saved.")
@@ -734,7 +725,7 @@ def menu_watchdog(profile_name: str, cfg: dict):
             cfg["watchdog_check_interval"] = ask_int("Probe interval (s)", ci, 10, 3600)
             cfg["watchdog_scan_interval"]  = ask_int("Periodic rescan (s)", si, 300, 86400)
             cfg["watchdog_fail_threshold"] = ask_int("Emergency threshold (fails)", ft, 1, 20)
-            cfg["watchdog_probe_url"]      = ask("Probe URL", url)
+            cfg["watchdog_probe_url"]      = ask_url_http("Probe URL", url)
             cfg["watchdog_probe_timeout"]  = ask_int(
                 "Probe timeout (s)  [15-20 recommended for slow tunnels]", pt, 2, 60)
             cfg["watchdog_probe_mode"] = ask(
@@ -934,7 +925,7 @@ def wizard(default_active: str = None) -> str | None:
 
     # 2/6 Server
     print(f"\n  {_c('2/6  Tunnel server',Y,BO)}\n")
-    cfg["domain"] = ask("Tunnel domain  (e.g. t.example.com)")
+    cfg["domain"] = ask_domain("Tunnel domain  (e.g. t.example.com)")
     if not cfg["domain"]: return None
     cfg["cert_path"]  = ask("Cert path  (blank if not needed)", "")
     cfg["socks_auth"] = ask_bool("Does the server require username/password?", False)
@@ -971,7 +962,7 @@ def wizard(default_active: str = None) -> str | None:
     cfg["watchdog_enabled"] = ask_bool("Enable watchdog?", True)
     if cfg["watchdog_enabled"]:
         cfg["watchdog_check_interval"] = ask_int("Probe every N seconds", 60, 10, 3600)
-        cfg["watchdog_probe_url"]      = ask(
+        cfg["watchdog_probe_url"]      = ask_url_http(
             "Probe URL  [use http://1.1.1.1 — plain HTTP, most reliable]", "http://1.1.1.1")
         cfg["watchdog_probe_timeout"]  = ask_int(
             "Probe timeout (s)  [15-20s recommended for slow tunnels]", 15, 2, 60)
@@ -983,11 +974,16 @@ def wizard(default_active: str = None) -> str | None:
     # 6/6 Scan settings
     print(f"\n  {_c('6/6  Scan Settings',Y,BO)}\n")
     print(f"  {_c('Country code for the IP ranges to scan.',DIM)}\n")
-    cfg["country"]        = ask("Country code", "ir")
+    cfg["country"]        = ask_country_code("Country code", "ir")
     cfg["scan_mode"]      = ask("Scan mode  (list / fast / medium / all)", "fast")
-    cfg["scan_workers"]   = ask_int("Workers", 4000, 100, 16000)
-    cfg["scan_timeout"]   = ask("Timeout", "1s")
+    cfg["scan_workers"]   = ask_int("Workers", 1200, 100, 16000)
+    cfg["scan_timeout"]   = ask_timeout_str("Timeout", "1s")
     cfg["scan_threshold"] = ask_int("Benchmark threshold %", 50, 1, 100)
+    cfg["verify_sample_count"] = ask_int("E2E verify top N candidates", 20, 1, 500)
+    cfg["dns_precheck_mode"] = ask("DNS precheck mode (quick/full)", "quick").lower() or "quick"
+    cfg["scan_burst_count"] = ask_int("Burst filter query count", 6, 0, 30)
+    cfg["scan_burst_workers"] = ask_int("Burst filter workers", 64, 1, 512)
+    cfg["monitor_refresh_sec"] = ask_int("Live monitor refresh (s)", 2, 1, 10)
     core.save_cfg(name, cfg)
 
     if ask_bool("Scan for resolvers now?", True):
@@ -1075,29 +1071,19 @@ def menu_profiles(active: str) -> str:
             except ValueError: pass
             warn("Invalid choice."); time.sleep(0.5)
 
+
+
+
 def menu_live_monitor(profile_name: str, cfg: dict):
-    """Live runtime dashboard. Ctrl+C to return."""
-    try:
-        while True:
-            clr()
-            section(f"Live Monitor  ·  {profile_name}")
-            st = core.tunnel_runtime_stats(profile_name)
-            conn = pill("CONNECTED", G) if st["connected"] else pill("DISCONNECTED", R)
-            lat = f"{st['active_latency_ms']} ms" if st.get("active_latency_ms") is not None else "-"
-            print(f"  Status           {conn}")
-            print(f"  Download         {_c(fmt_rate(st['down_bps']), G, BO)}")
-            print(f"  Upload           {_c(fmt_rate(st['up_bps']), C, BO)}")
-            print(f"  Total Download   {_c(fmt_bytes(st['total_down']), BO)}")
-            print(f"  Total Upload     {_c(fmt_bytes(st['total_up']), BO)}")
-            print(f"  Active port      {_c(st.get('active_port') or '-', BO)}")
-            print(f"  Active resolver  {_c(st.get('active_resolver') or '-', BO)}")
-            print(f"  Resolver latency {_c(lat, BO)}")
-            print(f"  Connections      {_c(st.get('total_conns', 0), BO)}")
-            print() 
-            print(f"  {_c('Ctrl+C to return', DIM)}")
-            time.sleep(1)
-    except KeyboardInterrupt:
-        return
+    return ui_runtime.run_live_monitor(core, profile_name, cfg, {
+        "clr": clr,
+        "section": section,
+        "pill": pill,
+        "_c": _c,
+        "fmt_rate": fmt_rate,
+        "fmt_bytes": fmt_bytes,
+        "colors": {"G": G, "R": R, "C": C, "BO": BO, "DIM": DIM},
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1128,11 +1114,17 @@ def main_menu(start_profile: str = None):
         print(f"  {_c('m',DIM)})  Live monitor")
         print(f"  {_c('?',DIM)})  Connection info")
         print(f"  {_c('g',DIM)})  Logs")
+        print(f"  {_c('y',DIM)})  Toggle system proxy now")
+        print(f"  {_c('u',DIM)})  Restore system proxy defaults")
         print()
         print(f"  {_c('0',DIM)})  Exit")
         print()
 
-        choice = input(f"  {_c('>',C,BO)} ").strip().lower()
+        raw_choice = input(f"  {_c('>',C,BO)} ").strip().lower()
+        if not raw_choice:
+            continue
+        aliases = {"start":"t","stop":"t","restart":"r","scan":"s","health":"h","resolvers":"l","watchdog":"w","profiles":"p","config":"c","monitor":"m","logs":"g","proxy":"y","toggle-proxy":"y","restore-proxy":"u","exit":"0","quit":"0"}
+        choice = aliases.get(raw_choice, raw_choice)
 
         if choice == "t":
             if core.tunnel_running():
@@ -1167,6 +1159,19 @@ def main_menu(start_profile: str = None):
             menu_connection_info(cfg)
         elif choice == "g":
             menu_logs(active)
+        elif choice == "y":
+            ok_toggle, detail = core.toggle_system_proxy_runtime(cfg)
+            if ok_toggle:
+                ok(f"System proxy {detail}.")
+            else:
+                warn(f"System proxy toggle failed: {detail}")
+            pause()
+        elif choice == "u":
+            if core.restore_system_proxy_defaults():
+                ok("System proxy restored to previously captured defaults.")
+            else:
+                warn("Could not restore previous proxy settings (or no backup exists).")
+            pause()
         elif choice == "0":
             if core.tunnel_running() and ask_bool("Stop tunnel before exiting?", True):
                 core.stop_all(cfg)
@@ -1207,6 +1212,12 @@ def main():
         for line in core.bootstrap_binaries():
             print(f"    - {line}")
         print()
+
+    c_ok, c_detail = core.diagnose_client_binary()
+    if not c_ok:
+        warn(f"Client diagnostic: {c_detail}")
+        if "OpenSSL" in c_detail or "libcrypto" in c_detail:
+            info("Fix: place libcrypto-3-x64.dll and libssl-3-x64.dll next to slipstream-client EXE, then restart.")
 
     if args.no_menu:
         # #10: Headless mode with PID file, periodic status, signal handlers
