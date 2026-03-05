@@ -142,7 +142,12 @@ def print_header(active: str, cfg: dict):
     clr()
     servers = core.load_servers(active)
     print()
-    print(f"  {_c('◈  slipstream-tunnel', C, BO)}  {_c(platform.system(), DIM)}")
+    print("  " + _c("  _____ ____   ____      _____                                  ", C, BO))
+    print("  " + _c(r" / ____/ __ \ / __ \    / ___/___  ______  _____ ___  ___      ", C, BO))
+    print("  " + _c(r"/ / __/ /_/ // /_/ /____ \__ \/ / / / __ \/ ___/ _ \/ _ \     ", C, BO))
+    print("  " + _c(r"/ /_/ / ____// ____/____/___/ / /_/ / /_/ / /  /  __/  __/     ", C, BO))
+    print("  " + _c(r"\____/_/    /_/          /____/\__,_/ .___/_/   \___/\___/      ", C, BO))
+    print("  " + _c("                                   /_/  SSC-Supreme", C, BO) + "  " + _c(platform.system(), DIM))
     print()
     hr()
     print(f"  {_c('Profile', DIM)}  {_c(active, M, BO)}")
@@ -592,6 +597,9 @@ def menu_configure(profile_name: str, cfg: dict):
         cfg["http_proxy_port"] = ask_int(
             "HTTP proxy port  (enter this in browser / OS settings)",
             cfg["http_proxy_port"], 1024, 65000)
+        cfg["domestic_bypass_enabled"] = ask_bool(
+            "Bypass domestic IR domains/IPs directly (ir.domains + ir.cidr)?",
+            bool(cfg.get("domestic_bypass_enabled", True)))
     else:
         cfg["system_proxy"] = False
 
@@ -627,6 +635,8 @@ def menu_configure(profile_name: str, cfg: dict):
     cfg["scan_timeout"]   = ask_timeout_str("Default timeout  (e.g. 1s)",    cfg["scan_timeout"])
     cfg["scan_threshold"] = ask_int("Default benchmark threshold%",
                                      cfg["scan_threshold"], 1, 100)
+    cfg["scan_target_count"] = ask_int("Resolver candidates from resolvers.txt",
+                                        cfg.get("scan_target_count", 7000), 100, 20000)
     cfg["scan_burst_count"] = ask_int("Burst filter query count", cfg.get("scan_burst_count", 6), 0, 30)
     cfg["scan_burst_workers"] = ask_int("Burst filter workers", cfg.get("scan_burst_workers", 64), 1, 512)
     cfg["verify_workers"] = ask_int(
@@ -638,6 +648,12 @@ def menu_configure(profile_name: str, cfg: dict):
     cfg["verify_sample_count"] = ask_int(
         "How many scan candidates to E2E verify",
         cfg.get("verify_sample_count", 20), 1, 500)
+    cfg["verify_all_candidates"] = ask_bool(
+        "E2E verify all scanned candidates (SlipNet-style complete test)?",
+        bool(cfg.get("verify_all_candidates", True)))
+    cfg["verify_strict_required"] = ask_bool(
+        "Reject candidates if full E2E verify fails (no unverified fallback)?",
+        bool(cfg.get("verify_strict_required", True)))
     cfg["dns_precheck_mode"] = ask(
         "DNS precheck mode (quick/full)",
         cfg.get("dns_precheck_mode", "quick")).lower() or "quick"
@@ -979,7 +995,11 @@ def wizard(default_active: str = None) -> str | None:
     cfg["scan_workers"]   = ask_int("Workers", 1200, 100, 16000)
     cfg["scan_timeout"]   = ask_timeout_str("Timeout", "1s")
     cfg["scan_threshold"] = ask_int("Benchmark threshold %", 50, 1, 100)
-    cfg["verify_sample_count"] = ask_int("E2E verify top N candidates", 20, 1, 500)
+    cfg["verify_sample_count"] = ask_int("E2E verify top N candidates (used if not verify-all)", 20, 1, 500)
+    cfg["verify_all_candidates"] = ask_bool(
+        "E2E verify all scanned candidates (SlipNet-style complete test)?", True)
+    cfg["verify_strict_required"] = ask_bool(
+        "Reject candidates when E2E verify fails?", True)
     cfg["dns_precheck_mode"] = ask("DNS precheck mode (quick/full)", "quick").lower() or "quick"
     cfg["scan_burst_count"] = ask_int("Burst filter query count", 6, 0, 30)
     cfg["scan_burst_workers"] = ask_int("Burst filter workers", 64, 1, 512)

@@ -10,14 +10,15 @@ def verify_candidates_interactive(core, profile_name: str, cfg: dict, candidates
     if not candidates:
         return []
 
+    verify_all = bool(cfg.get("verify_all_candidates", True))
     verify_n = max(1, int(cfg.get("verify_sample_count", 20)))
-    n_test = min(len(candidates), verify_n)
+    n_test = len(candidates) if verify_all else min(len(candidates), verify_n)
     workers = cfg.get("verify_workers", 4)
     eta_s = max(8, (n_test // max(1, workers) + 1) * 8)
 
     print()
     do_verify = ui["ask_bool"](
-        f"Tunnel-verify top {n_test} candidate(s)? "
+        f"Tunnel-verify {'all' if verify_all else 'top'} {n_test} candidate(s)? "
         f"(~{eta_s}s with {workers} parallel workers — confirms actual tunnel + hijack check)",
         default=True,
     )
@@ -75,6 +76,10 @@ def verify_candidates_interactive(core, profile_name: str, cfg: dict, candidates
         print()
         ui["warn"]("All verifications failed — this usually means the tunnel server is")
         ui["warn"]("unreachable or the domain is wrong, NOT that the resolvers are bad.")
+        if cfg.get("verify_strict_required", True):
+            ui["warn"]("Strict E2E mode is enabled — unverified candidates are rejected.")
+            print(f"  {ui['_c']('Tip:', ui['colors']['DIM'])} Check your domain/server, then re-scan.")
+            return []
         ui["warn"]("Falling back to unverified candidates so you can still start the tunnel.")
         print(f"  {ui['_c']('Tip:', ui['colors']['DIM'])} Check your domain and server, then re-scan.")
         return candidates
