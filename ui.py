@@ -142,7 +142,12 @@ def print_header(active: str, cfg: dict):
     clr()
     servers = core.load_servers(active)
     print()
-    print(f"  {_c('◈  slipstream-tunnel', C, BO)}  {_c(platform.system(), DIM)}")
+    print("  " + _c("  _____ ____   ____      _____                                  ", C, BO))
+    print("  " + _c(r" / ____/ __ \ / __ \    / ___/___  ______  _____ ___  ___      ", C, BO))
+    print("  " + _c(r"/ / __/ /_/ // /_/ /____ \__ \/ / / / __ \/ ___/ _ \/ _ \     ", C, BO))
+    print("  " + _c(r"/ /_/ / ____// ____/____/___/ / /_/ / /_/ / /  /  __/  __/     ", C, BO))
+    print("  " + _c(r"\____/_/    /_/          /____/\__,_/ .___/_/   \___/\___/      ", C, BO))
+    print("  " + _c("                                   /_/  SSC-Supreme", C, BO) + "  " + _c(platform.system(), DIM))
     print()
     hr()
     print(f"  {_c('Profile', DIM)}  {_c(active, M, BO)}")
@@ -592,6 +597,9 @@ def menu_configure(profile_name: str, cfg: dict):
         cfg["http_proxy_port"] = ask_int(
             "HTTP proxy port  (enter this in browser / OS settings)",
             cfg["http_proxy_port"], 1024, 65000)
+        cfg["domestic_bypass_enabled"] = ask_bool(
+            "Bypass domestic IR domains/IPs directly (ir.domains + ir.cidr)?",
+            bool(cfg.get("domestic_bypass_enabled", True)))
     else:
         cfg["system_proxy"] = False
 
@@ -627,6 +635,8 @@ def menu_configure(profile_name: str, cfg: dict):
     cfg["scan_timeout"]   = ask_timeout_str("Default timeout  (e.g. 1s)",    cfg["scan_timeout"])
     cfg["scan_threshold"] = ask_int("Default benchmark threshold%",
                                      cfg["scan_threshold"], 1, 100)
+    cfg["scan_target_count"] = ask_int("Resolver candidates from resolvers.txt",
+                                        cfg.get("scan_target_count", 7000), 100, 20000)
     cfg["scan_burst_count"] = ask_int("Burst filter query count", cfg.get("scan_burst_count", 6), 0, 30)
     cfg["scan_burst_workers"] = ask_int("Burst filter workers", cfg.get("scan_burst_workers", 64), 1, 512)
     cfg["verify_workers"] = ask_int(
