@@ -1,4 +1,4 @@
-"""App entrypoint for SlipClient-Supreme.
+"""App entrypoint for SSC-Supreme.
 
 Run:
     python start.py

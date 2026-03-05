@@ -5,7 +5,7 @@ No print() calls except progress feedback from dnscan passthrough.
 Import this from ui.py; never run directly.
 """
 
-import base64, json, os, platform, random, re, signal, socket, struct
+import base64, ipaddress, json, os, platform, random, re, signal, socket, struct
 import subprocess, sys, threading, time, atexit
 if platform.system() == "Windows":
     try:
@@ -29,6 +29,9 @@ from core_pool import merge_new_with_existing, surviving_resolvers
 BASE_DIR     = Path(__file__).parent.resolve()
 BIN_DIR      = BASE_DIR / "bin"
 DNSCAN_DATA  = BIN_DIR / "dnscan" / "data"
+APP_RES_DIR  = BASE_DIR / "resources"
+APP_DNS_DIR  = APP_RES_DIR / "dns"
+APP_GEO_DIR  = APP_RES_DIR / "geo"
 
 def _ensure_executable(path: Path):
     """On macOS/Linux, binaries extracted from .tar.gz need chmod +x."""
@@ -270,6 +273,7 @@ DEFAULT_CFG = {
     # System proxy
     "system_proxy":             False,
     "enable_http_proxy":        True,
+    "domestic_bypass_enabled":  True,
     # Multi-instance
     "multi_instance":           1,
     # Scan
@@ -282,6 +286,7 @@ DEFAULT_CFG = {
     "scan_burst_timeout":       0.8,
     "scan_burst_workers":       64,
     "scan_burst_min_pass":      0.35,
+    "scan_target_count":        7000,
     "monitor_refresh_sec":      2,
     # Watchdog
     "watchdog_enabled":         False,
@@ -1277,51 +1282,87 @@ def run_dnscan(cfg: dict, profile_name: str,
     Returns list of IPs that passed the benchmark.
     Auto-selects scan mode if not specified (#11).
     """
-    if not DNSCAN_EXE.exists():
-        return []
-
     out = output or (pdir(profile_name) / "scan_out.txt")
-    m   = mode or cfg["scan_mode"]
-    cmd = [
-        str(DNSCAN_EXE),
-        "--country",   cfg["country"],
-        "--domain",    cfg["domain"],
-        "--mode",      m,
-        "--workers",   str(cfg["scan_workers"]),
-        "--timeout",   cfg["scan_timeout"],
-        "--threshold", str(cfg["scan_threshold"]),
-        "--data-dir",  str(DNSCAN_DATA),
-        "--output",    str(out),
-    ]
-    # We always skip dnscan's built-in --verify and run verify_resolvers_parallel()
-    # in _do_scan instead, which uses socket-ready polling and DNS integrity checks.
-    # (dnscan --verify is also unreliable on Windows and macOS for the same reason)
+    m = (mode or cfg["scan_mode"] or "fast").lower()
 
-    _ensure_executable(DNSCAN_EXE)
-    try:
-        with open(logfile(profile_name, "scan"), "w", encoding="utf-8") as lf:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            for line in proc.stdout:
-                lf.write(line)
-                if progress_cb:
-                    progress_cb(line.rstrip())
-            proc.wait()
-    except Exception as e:
-        if progress_cb:
-            progress_cb(f"[error] dnscan failed: {e}")
+    def _timeout_to_seconds(v: str) -> float:
+        try:
+            s = str(v).strip().lower()
+            if s.endswith("ms"):
+                return max(0.2, float(s[:-2]) / 1000.0)
+            if s.endswith("s"):
+                return max(0.2, float(s[:-1]))
+            return max(0.2, float(s))
+        except Exception:
+            return 1.0
+
+    def _load_ip_file(path: Path) -> list[str]:
+        if not path.exists():
+            return []
+        out_ips = []
+        for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            ip = ln.strip()
+            if not ip or ip.startswith("#"):
+                continue
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                out_ips.append(ip)
+        return out_ips
+
+    def _candidate_pool(country: str, target: int) -> list[str]:
+        # Requested behavior: use resolver corpus from resolvers.txt, not random IP sampling.
+        known = _load_ip_file(APP_DNS_DIR / "resolvers.txt")
+        if not known:
+            known = _load_ip_file(DNSCAN_DATA / "dns" / f"{country.lower()}.txt")
+        # Keep file order (famous resolvers are intentionally prioritized).
+        dedup = list(dict.fromkeys(known))
+        return dedup[:max(target, 1)]
+
+    target = max(300, int(cfg.get("scan_target_count", 7000)))
+    if m == "list":
+        target = min(target, 900)
+    elif m == "medium":
+        target = min(target, 3000)
+    elif m == "fast":
+        target = min(target, 7000)
+
+    probe_timeout = _timeout_to_seconds(cfg.get("scan_timeout", "1s"))
+    workers = max(16, min(1024, int(cfg.get("scan_workers", 1200))))
+    ips = _candidate_pool(cfg.get("country", "ir"), target)
+    if progress_cb:
+        progress_cb(f"[scan] scanner=python target={len(ips)} mode={m} workers={workers}")
+    if not ips:
         return []
 
-    results = []
-    if out.exists():
-        for line in out.read_text(encoding="utf-8").splitlines():
-            ip = line.strip()
-            if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+    results: list[str] = []
+    scored: list[tuple[str, float]] = []
+    verify_mode = "full" if m in ("medium", "full") else "quick"
+
+    def _probe(ip: str):
+        ok, _ = scan_resolver_dns_tunnel(ip, cfg["domain"], timeout=probe_timeout, mode=verify_mode)
+        if not ok:
+            return ip, 0.0
+        ratio = burst_dns_success(ip, cfg["domain"], timeout=min(1.2, probe_timeout), count=int(cfg.get("scan_burst_count", 6)))
+        return ip, ratio
+
+    done = 0
+    min_ratio = float(cfg.get("scan_burst_min_pass", 0.35))
+    with ThreadPoolExecutor(max_workers=min(workers, len(ips))) as ex:
+        futures = {ex.submit(_probe, ip): ip for ip in ips}
+        for fut in as_completed(futures):
+            done += 1
+            ip, ratio = fut.result()
+            if ratio >= min_ratio:
                 results.append(ip)
+                scored.append((ip, ratio))
+                if progress_cb:
+                    progress_cb(f"[ok] {ip} qps={ratio:.2f}")
+            elif progress_cb and done % 250 == 0:
+                progress_cb(f"[scan] checked={done}/{len(ips)} found={len(results)}")
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    results = [ip for ip, _ in scored]
+
+    out.write_text("\n".join(results) + ("\n" if results else ""), encoding="utf-8")
 
     # Post-filter with parallel burst sampling to reduce false positives quickly.
     burst_n = int(cfg.get("scan_burst_count", 6) or 0)
@@ -1354,6 +1395,24 @@ def run_dnscan(cfg: dict, profile_name: str,
         results = kept
 
     return results
+
+
+def restart_dead_instances(cfg: dict, profile_name: str) -> int:
+    """Restart only dead tunnel instances, preserving healthy ones."""
+    restarted = 0
+    with _inst_lock:
+        for i, inst in enumerate(list(_instances)):
+            if inst.alive():
+                continue
+            repl = _Instance(inst.index, inst.port, list(inst.resolvers), cfg)
+            ok, detail = repl.start(profile_name=profile_name)
+            if ok:
+                _instances[i] = repl
+                restarted += 1
+                flog(profile_name, "watchdog", f"Restarted dead instance {inst.index+1} on port {inst.port}")
+            else:
+                flog(profile_name, "watchdog", f"Dead instance {inst.index+1} restart failed: {detail}")
+    return restarted
 
 # ─────────────────────────────────────────────────────────────────────────────
 # #6  ADAPTIVE KEEP-ALIVE
@@ -1703,6 +1762,85 @@ _proxy_stop    = threading.Event()
 _proxy_srv     = None
 _rr_idx        = 0
 _rr_lock       = threading.Lock()
+_domestic_domains_cache: set[str] | None = None
+_domestic_cidrs_cache: list[ipaddress.IPv4Network] | None = None
+
+
+def _load_domestic_domains() -> set[str]:
+    global _domestic_domains_cache
+    if _domestic_domains_cache is not None:
+        return _domestic_domains_cache
+    path = APP_GEO_DIR / "ir.domains"
+    out: set[str] = set()
+    if path.exists():
+        for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            d = ln.strip().lower().lstrip(".")
+            if not d or d.startswith("#"):
+                continue
+            out.add(d)
+    _domestic_domains_cache = out
+    return out
+
+
+def _load_domestic_cidrs() -> list[ipaddress.IPv4Network]:
+    global _domestic_cidrs_cache
+    if _domestic_cidrs_cache is not None:
+        return _domestic_cidrs_cache
+    path = APP_GEO_DIR / "ir.cidr"
+    nets: list[ipaddress.IPv4Network] = []
+    if path.exists():
+        for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            cidr = ln.strip()
+            if not cidr or cidr.startswith("#"):
+                continue
+            try:
+                net = ipaddress.ip_network(cidr, strict=False)
+                if isinstance(net, ipaddress.IPv4Network):
+                    nets.append(net)
+            except Exception:
+                continue
+    _domestic_cidrs_cache = nets
+    return nets
+
+
+def _is_domestic_target(host: str) -> bool:
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return False
+    try:
+        ip = ipaddress.ip_address(h)
+        if isinstance(ip, ipaddress.IPv4Address):
+            return any(ip in n for n in _load_domestic_cidrs())
+        return False
+    except Exception:
+        pass
+    if h.endswith(".ir"):
+        return True
+    for d in _load_domestic_domains():
+        if h == d or h.endswith("." + d):
+            return True
+    return False
+
+
+def _normalize_http_proxy_request(buf: bytes, url: str) -> bytes:
+    """Convert absolute-form proxy request to origin-form for direct upstream."""
+    try:
+        head, rest = (buf.split(b"\r\n\r\n", 1) + [b""])[:2]
+        lines = head.split(b"\r\n")
+        if not lines:
+            return buf
+        first = lines[0].decode("latin1", errors="replace")
+        parts = first.split(" ", 2)
+        if len(parts) < 3:
+            return buf
+        method, _orig_url, version = parts
+        m = re.match(r"https?://[^/]+(/.*)?$", url)
+        path = m.group(1) if m else "/"
+        path = path or "/"
+        lines[0] = f"{method} {path} {version}".encode("latin1", errors="replace")
+        return b"\r\n".join(lines) + b"\r\n\r\n" + rest
+    except Exception:
+        return buf
 
 
 def _pick_instance() -> "_Instance | None":
@@ -1794,10 +1932,15 @@ def _proxy_handle(sock, base_port, user, passwd, connect_timeout=20, cfg: dict |
         sp = _pick_port(base_port)
         if method == "CONNECT":
             host, port = url.rsplit(":", 1); port = int(port)
+            bypass_domestic = bool((cfg or {}).get("domestic_bypass_enabled", True))
+            direct = bypass_domestic and _is_domestic_target(host)
             try:
-                up = _socks5_open("127.0.0.1", sp, host, port,
-                                  user or None, passwd,
-                                  timeout=connect_timeout)
+                if direct:
+                    up = socket.create_connection((host, port), timeout=connect_timeout)
+                else:
+                    up = _socks5_open("127.0.0.1", sp, host, port,
+                                      user or None, passwd,
+                                      timeout=connect_timeout)
                 if cfg:
                     _tune_tcp_socket(up, cfg)
             except Exception as e:
@@ -1810,10 +1953,16 @@ def _proxy_handle(sock, base_port, user, passwd, connect_timeout=20, cfg: dict |
             if not m:
                 sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n"); return
             host = m.group(1); port = int(m.group(2) or 80)
+            bypass_domestic = bool((cfg or {}).get("domestic_bypass_enabled", True))
+            direct = bypass_domestic and _is_domestic_target(host)
             try:
-                up = _socks5_open("127.0.0.1", sp, host, port,
-                                  user or None, passwd,
-                                  timeout=connect_timeout)
+                if direct:
+                    up = socket.create_connection((host, port), timeout=connect_timeout)
+                    buf = _normalize_http_proxy_request(buf, url)
+                else:
+                    up = _socks5_open("127.0.0.1", sp, host, port,
+                                      user or None, passwd,
+                                      timeout=connect_timeout)
                 if cfg:
                     _tune_tcp_socket(up, cfg)
             except Exception:
@@ -2069,6 +2218,10 @@ def _watchdog_loop(profile_name: str):
 
             cfg = load_cfg(profile_name)
 
+            restarted = restart_dead_instances(cfg, profile_name)
+            if restarted:
+                time.sleep(1)
+
             # ── 1. End-to-end probe through configured path ───────────────────
             probe_ok, probe_detail = probe_tunnel(
                 cfg,
@@ -2124,8 +2277,12 @@ def _watchdog_loop(profile_name: str):
                 flog(profile_name, "watchdog", f"Fail #{consec_fails}/{cfg['watchdog_fail_threshold']}")
 
                 if consec_fails == 1:
-                    flog(profile_name, "watchdog", "Quick restart")
-                    restart_tunnel(cfg, profile_name)
+                    restarted = restart_dead_instances(cfg, profile_name)
+                    if restarted:
+                        flog(profile_name, "watchdog", f"Quick self-heal restarted {restarted} dead instance(s)")
+                    else:
+                        flog(profile_name, "watchdog", "Quick restart")
+                        restart_tunnel(cfg, profile_name)
                     time.sleep(3)
                     _recheck, _detail = probe_tunnel(cfg, timeout=cfg.get("watchdog_probe_timeout", 12))
                     if _recheck:
