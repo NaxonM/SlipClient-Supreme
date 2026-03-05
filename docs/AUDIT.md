@@ -36,3 +36,38 @@
 
 4. **Documentation drift**
    - The included docs mix upstream Slipstream/deploy/dnscan narratives and can confuse ownership/supported features for this client app. A project-specific README for this repo should clarify exact behavior and limitations.
+
+
+## Additional improvements in follow-up pass
+
+- Decomposed UI runtime/monitor logic into `ui_runtime.py` (snapshot model + live monitor runner).
+- Decomposed resolver E2E maintenance flow into `ui_resolver_maintenance.py` to keep menu logic leaner and testable.
+- Main menu now accepts word aliases (`start`, `scan`, `watchdog`, `exit`, etc.) in addition to single-key shortcuts.
+- Header now includes a compact live runtime strip (down/up/latency/conn count) when tunnel is active, reducing context switches to monitor page.
+
+- Core decomposition started: DNS scan/compatibility logic moved to `core_dns.py` and resolver pool merge helpers moved to `core_pool.py`; `core.py` now composes these modules instead of hosting all internals in one file.
+
+
+## Stability and safety hardening pass
+
+- Added startup client binary diagnostics (`diagnose_client_binary`) to detect missing OpenSSL runtime DLLs on Windows and provide actionable guidance.
+- Added runtime system-proxy controls: toggle without stopping tunnel + explicit restore-to-defaults operation.
+- Added proxy guard backup/restore safety (`state/system_proxy_backup.json`) with exit hooks to reduce risk of stuck network settings after crashes/exits.
+- Refined defaults to reduce resource usage spikes (`scan_workers` lowered to 1200, monitor refresh to 2s).
+- Expanded input validation in UI (domain, timeout, URL, country code) to reduce bad config states.
+- Added complete user-facing guide in `docs/USER_GUIDE.md`.
+- Expanded UI runtime module to include timed menu input + auto-refresh monitor mechanics, and moved candidate verification flow into resolver maintenance module to reduce `ui.py` size further.
+- Monitor latency display now rounds to integer milliseconds for readability.
+- Added configurable `verify_sample_count` default to improve scan-quality control.
+
+## Input responsiveness fix pass
+
+- Removed aggressive header live-refresh loop that could interfere with interactive input; near-real-time stats remain in dedicated monitor section only.
+- Added `start.py` as a clear, distinct application entrypoint.
+
+
+## Resolver pipeline performance pass
+
+- Reduced default `verify_timeout` to 10s and switched DNS precheck to configurable mode (`quick` by default).
+- Implemented parallel burst filtering in `run_dnscan` using ThreadPoolExecutor to speed post-scan quality filtering.
+- Added config knobs for faster/slower quality tradeoffs: `scan_burst_count`, `scan_burst_timeout`, `scan_burst_workers`, `scan_burst_min_pass`, `verify_sample_count`, and `dns_precheck_mode`.
