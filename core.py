@@ -6,7 +6,7 @@ Import this from ui.py; never run directly.
 """
 
 import base64, json, os, platform, random, re, signal, socket, struct
-import subprocess, sys, threading, time
+import subprocess, sys, threading, time, atexit
 if platform.system() == "Windows":
     try:
         import winreg as _winreg
@@ -19,6 +19,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+
+from core_dns import burst_dns_success, scan_resolver_dns_tunnel
+from core_pool import merge_new_with_existing, surviving_resolvers
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
@@ -81,6 +84,25 @@ def _client_supported_flags() -> set[str]:
     _CLIENT_HELP_CACHE = flags
     return flags
 
+
+
+
+def diagnose_client_binary() -> tuple[bool, str]:
+    """Return (ok, detail). Detect common runtime dependency failures early."""
+    if not CLIENT_EXE.exists():
+        return False, f"missing client binary: {CLIENT_EXE}"
+    try:
+        _ensure_executable(CLIENT_EXE)
+        out = subprocess.check_output([str(CLIENT_EXE), "--help"], stderr=subprocess.STDOUT, text=True, timeout=5)
+        return True, out.splitlines()[0] if out else "ok"
+    except subprocess.CalledProcessError as e:
+        txt = (e.output or "").lower()
+        if "libcrypto-3" in txt or "libssl-3" in txt:
+            return False, ("client runtime dependency missing (OpenSSL 3 DLL). "
+                           "Windows builds may require libcrypto-3-x64.dll/libssl-3-x64.dll beside the client exe.")
+        return False, (e.output or str(e)).strip()
+    except Exception as e:
+        return False, str(e)
 
 def build_client_cmd(cfg: dict, resolvers: list[str], listen_port: int) -> list[str]:
     """Build slipstream-client command with feature flags only when supported."""
@@ -224,6 +246,7 @@ STATE_DIR    = BASE_DIR / "state"
 PROFILES_DIR = STATE_DIR / "profiles"
 ACTIVE_FILE  = STATE_DIR / "active_profile"
 PID_FILE     = STATE_DIR / "slipstream.pid"
+_PROXY_GUARD_FILE = STATE_DIR / "system_proxy_backup.json"
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
@@ -252,11 +275,14 @@ DEFAULT_CFG = {
     # Scan
     "country":                  "ir",
     "scan_mode":                "fast",
-    "scan_workers":             4000,
+    "scan_workers":             1200,
     "scan_timeout":             "1s",
     "scan_threshold":           50,
-    "scan_burst_count":         10,
-    "monitor_refresh_sec":      1,
+    "scan_burst_count":         6,
+    "scan_burst_timeout":       0.8,
+    "scan_burst_workers":       64,
+    "scan_burst_min_pass":      0.35,
+    "monitor_refresh_sec":      2,
     # Watchdog
     "watchdog_enabled":         False,
     "watchdog_check_interval":  60,
@@ -275,11 +301,13 @@ DEFAULT_CFG = {
     "keep_alive_max_ms":        2000,
     # Verification parallelism  (#3)
     "verify_workers":           4,
-    "verify_timeout":           14,
+    "verify_timeout":           10,
+    "verify_sample_count":      20,
     "verify_relaxed_retry":     True,
     "verify_relaxed_count":     6,
     "verify_probe_host":        "example.com",
     "verify_probe_port":        80,
+    "dns_precheck_mode":        "quick",
     # Multi-instance failover depth (extra resolvers after the primary)
     "instance_failover_count":  1,
 }
@@ -660,9 +688,109 @@ def _active_network_service() -> str:
     return "Wi-Fi"
 
 
+
+
+def _save_proxy_backup(enabled: bool, server: str):
+    try:
+        _PROXY_GUARD_FILE.write_text(json.dumps({"enabled": bool(enabled), "server": server or ""}), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_proxy_backup() -> dict | None:
+    try:
+        if not _PROXY_GUARD_FILE.exists():
+            return None
+        return json.loads(_PROXY_GUARD_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _clear_proxy_backup():
+    try:
+        _PROXY_GUARD_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def restore_system_proxy_defaults() -> bool:
+    """Restore previously captured system proxy settings (best effort)."""
+    bak = _load_proxy_backup()
+    if not bak:
+        return set_system_proxy(False)
+    if not bak.get("enabled"):
+        ok = set_system_proxy(False)
+        if ok:
+            _clear_proxy_backup()
+        return ok
+    srv = (bak.get("server") or "").strip()
+    m = re.match(r"^(?:https?://)?([^:]+):(\d+)$", srv)
+    if not m:
+        return False
+    host, port = m.group(1), int(m.group(2))
+    _sys = platform.system()
+    try:
+        if _sys == "Windows" and _winreg:
+            key = _winreg.OpenKey(_winreg.HKEY_CURRENT_USER, _WININET_KEY, 0, _winreg.KEY_SET_VALUE)
+            _winreg.SetValueEx(key, "ProxyEnable", 0, _winreg.REG_DWORD, 1)
+            _winreg.SetValueEx(key, "ProxyServer", 0, _winreg.REG_SZ, f"http://{host}:{port}")
+            _winreg.CloseKey(key)
+            try:
+                import ctypes
+                ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
+                ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)
+            except Exception:
+                pass
+            _clear_proxy_backup()
+            return True
+        if _sys == "Darwin":
+            svc = _active_network_service()
+            subprocess.run(["networksetup", "-setwebproxy", svc, host, str(port)], check=True, stderr=subprocess.DEVNULL)
+            subprocess.run(["networksetup", "-setsecurewebproxy", svc, host, str(port)], check=True, stderr=subprocess.DEVNULL)
+            subprocess.run(["networksetup", "-setwebproxystate", svc, "on"], check=True, stderr=subprocess.DEVNULL)
+            subprocess.run(["networksetup", "-setsecurewebproxystate", svc, "on"], check=True, stderr=subprocess.DEVNULL)
+            _clear_proxy_backup()
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def toggle_system_proxy_runtime(cfg: dict) -> tuple[bool, str]:
+    """Toggle system proxy on/off without stopping tunnel."""
+    if platform.system() == "Linux":
+        return False, "Linux system proxy is manual-only in this app."
+    enabled, _ = get_system_proxy()
+    if enabled:
+        ok = set_system_proxy(False)
+        return ok, "disabled" if ok else "failed"
+    if not cfg.get("enable_http_proxy", True):
+        return False, "HTTP proxy bridge is disabled."
+    ok = set_system_proxy(True, int(cfg.get("http_proxy_port", 8080)))
+    return ok, "enabled" if ok else "failed"
+
+
+def _register_proxy_guard():
+    """Ensure OS proxy is restored on abnormal exits (best effort)."""
+    def _cleanup(*_):
+        try:
+            restore_system_proxy_defaults()
+        except Exception:
+            pass
+    atexit.register(_cleanup)
+    if platform.system() != "Windows":
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(sig, lambda a, b: (_cleanup(), sys.exit(0)))
+            except Exception:
+                pass
+
 def set_system_proxy(enable: bool, port: int = 0) -> bool:
     _sys = platform.system()
     try:
+        if enable and not _load_proxy_backup():
+            prev_enabled, prev_server = get_system_proxy()
+            _save_proxy_backup(prev_enabled, prev_server)
         if _sys == "Windows" and _winreg:
             key = _winreg.OpenKey(_winreg.HKEY_CURRENT_USER, _WININET_KEY,
                                   0, _winreg.KEY_SET_VALUE)
@@ -677,6 +805,8 @@ def set_system_proxy(enable: bool, port: int = 0) -> bool:
                 ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)
             except Exception:
                 pass
+            if not enable:
+                _clear_proxy_backup()
             return True
 
         elif _sys == "Darwin":
@@ -698,6 +828,8 @@ def set_system_proxy(enable: bool, port: int = 0) -> bool:
                                  svc, "off"], check=False, stderr=subprocess.DEVNULL)
                 subprocess.run(["networksetup", "-setsecurewebproxystate",
                                  svc, "off"], check=False, stderr=subprocess.DEVNULL)
+            if not enable:
+                _clear_proxy_backup()
             return True
 
         # Linux: no universal system-proxy API; caller will show manual instructions
@@ -783,169 +915,7 @@ def _socks5_probe(host, port, target_host, target_port,
         return False
 
 
-def _dns_build_query(domain: str, qtype: int) -> tuple[int, bytes]:
-    txid = random.randint(1, 65534)
-    labels = domain.encode().split(b".")
-    qname = b"".join(bytes([len(l)]) + l for l in labels) + b"\x00"
-    pkt = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", qtype, 0x0001)
-    return txid, pkt
 
-
-def _dns_udp_query(ip: str, domain: str, qtype: int, timeout: float = 2.0):
-    """Returns (ok, rcode, response-bytes). ok=True for NOERROR or NXDOMAIN."""
-    try:
-        txid, pkt = _dns_build_query(domain, qtype)
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-        s.sendto(pkt, (ip, 53))
-        resp, _ = s.recvfrom(2048)
-        s.close()
-        if len(resp) < 4:
-            return False, -1, b""
-        rx = struct.unpack(">H", resp[:2])[0]
-        if rx != txid:
-            return False, -1, b""
-        rcode = struct.unpack(">H", resp[2:4])[0] & 0xF
-        return rcode in (0, 3), rcode, resp
-    except Exception:
-        return False, -1, b""
-
-
-def _dns_parent_domain(domain: str) -> str:
-    labels = [p for p in domain.split(".") if p]
-    return ".".join(labels[1:]) if len(labels) > 2 else domain
-
-
-def _dns_read_name(msg: bytes, pos: int) -> tuple[str, int]:
-    labels = []
-    jumped = False
-    jump_end = pos
-    loops = 0
-    while pos < len(msg) and loops < 64:
-        loops += 1
-        ln = msg[pos]
-        if ln == 0:
-            pos += 1
-            break
-        if ln & 0xC0 == 0xC0:
-            if pos + 1 >= len(msg):
-                break
-            ptr = ((ln & 0x3F) << 8) | msg[pos + 1]
-            if not jumped:
-                jump_end = pos + 2
-            pos = ptr
-            jumped = True
-            continue
-        pos += 1
-        if pos + ln > len(msg):
-            break
-        labels.append(msg[pos:pos + ln].decode("utf-8", errors="ignore"))
-        pos += ln
-    return ".".join(labels), (jump_end if jumped else pos)
-
-
-def _dns_extract_a_records(resp: bytes) -> list[str]:
-    if len(resp) < 12:
-        return []
-    qd = struct.unpack(">H", resp[4:6])[0]
-    an = struct.unpack(">H", resp[6:8])[0]
-    pos = 12
-    for _ in range(qd):
-        _, pos = _dns_read_name(resp, pos)
-        pos += 4
-    out = []
-    for _ in range(an):
-        if pos + 10 > len(resp):
-            break
-        _, pos = _dns_read_name(resp, pos)
-        if pos + 10 > len(resp):
-            break
-        rtype = struct.unpack(">H", resp[pos:pos+2])[0]
-        pos += 2
-        pos += 2  # class
-        pos += 4  # ttl
-        rdlen = struct.unpack(">H", resp[pos:pos+2])[0]
-        pos += 2
-        if pos + rdlen > len(resp):
-            break
-        rdata = resp[pos:pos+rdlen]
-        if rtype == 1 and rdlen == 4:
-            out.append(socket.inet_ntoa(rdata))
-        pos += rdlen
-    return out
-
-
-def _dns_parse_ns_hosts(resp: bytes) -> list[str]:
-    if len(resp) < 12:
-        return []
-    qd = struct.unpack(">H", resp[4:6])[0]
-    an = struct.unpack(">H", resp[6:8])[0]
-    ns = struct.unpack(">H", resp[8:10])[0]
-    pos = 12
-    for _ in range(qd):
-        _, pos = _dns_read_name(resp, pos)
-        pos += 4
-    out = []
-    for _ in range(an + ns):
-        if pos + 10 > len(resp):
-            break
-        _, pos = _dns_read_name(resp, pos)
-        if pos + 10 > len(resp):
-            break
-        rtype = struct.unpack(">H", resp[pos:pos + 2])[0]
-        pos += 8
-        rdlen = struct.unpack(">H", resp[pos:pos + 2])[0]
-        pos += 2
-        if pos + rdlen > len(resp):
-            break
-        if rtype == 2:
-            name, _ = _dns_read_name(resp, pos)
-            if name:
-                out.append(name.rstrip("."))
-        pos += rdlen
-    return out
-
-
-def scan_resolver_dns_tunnel(ip: str, domain: str, timeout: float = 2.0) -> tuple[bool, dict]:
-    """
-    SlipNet-style resolver compatibility checks:
-      1) Basic A query to random parent-domain subdomain
-      2) NS delegation + glue A check
-      3) TXT support
-      4) Two nested random-subdomain checks against tunnel domain
-    """
-    parent = _dns_parent_domain(domain)
-    rand = lambda n=8: "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(n))
-
-    basic_ok, _, _ = _dns_udp_query(ip, f"{rand()}.{parent}", 1, timeout)
-    if not basic_ok:
-        return False, {"basic": False, "ns": False, "txt": False, "r1": False, "r2": False}
-
-    ns_ok = False
-    ok_ns, _, ns_resp = _dns_udp_query(ip, parent, 2, timeout)
-    if ok_ns:
-        hosts = _dns_parse_ns_hosts(ns_resp)
-        if hosts:
-            glue_ok, _, _ = _dns_udp_query(ip, hosts[0], 1, timeout)
-            ns_ok = glue_ok
-
-    txt_ok, _, _ = _dns_udp_query(ip, f"{rand()}.{parent}", 16, timeout)
-    r1_ok, _, _ = _dns_udp_query(ip, f"{rand()}.{rand()}.{domain}", 1, timeout)
-    r2_ok, _, _ = _dns_udp_query(ip, f"{rand()}.{rand()}.{domain}", 1, timeout)
-
-    # Hijack/censorship hint: one.one.one.one should not resolve to private space.
-    hijack = False
-    cf_ok, _, cf_resp = _dns_udp_query(ip, "one.one.one.one", 1, timeout)
-    if cf_ok and cf_resp:
-        for a in _dns_extract_a_records(cf_resp):
-            if re.match(r"^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|0\.)", a):
-                hijack = True
-                break
-
-    checks = {"basic": True, "ns": ns_ok, "txt": txt_ok, "r1": r1_ok, "r2": r2_ok, "hijack": hijack}
-    # Match SlipNet behavior: basic connectivity gates acceptance;
-    # other checks are quality signals.
-    return (not hijack), checks
 
 
 # ── #9: DNS integrity check — detect hijacking transparent proxies ────────────
@@ -1064,7 +1034,12 @@ def verify_resolver(ip: str, cfg: dict, timeout: float = 12.0,
 
     # SlipNet-style DNS tunnel compatibility pre-check before full E2E run.
     if dns_precheck:
-        compatible, _ = scan_resolver_dns_tunnel(ip, cfg["domain"], timeout=min(timeout, 3.0))
+        compatible, _ = scan_resolver_dns_tunnel(
+            ip,
+            cfg["domain"],
+            timeout=min(timeout, 2.0),
+            mode=str(cfg.get("dns_precheck_mode", "quick")).lower(),
+        )
         if not compatible:
             if profile_name:
                 mark_verified(profile_name, ip, False)
@@ -1291,17 +1266,7 @@ def auto_scan_mode(profile_name: str, reason: str = "manual") -> str:
 
 
 
-def _burst_dns_success(ip: str, domain: str, timeout: float, count: int = 10) -> float:
-    """Return success ratio for repeated randomized DNS tunnel queries."""
-    if count <= 0:
-        return 1.0
-    ok = 0
-    for _ in range(count):
-        q = f"{''.join(random.choice('abcdefghijklmnopqrstuvwxyz0123456789') for _ in range(8))}.{domain}"
-        passed, _, _ = _dns_udp_query(ip, q, 1, timeout)
-        if passed:
-            ok += 1
-    return ok / float(count)
+
 
 def run_dnscan(cfg: dict, profile_name: str,
                mode: str = None,
@@ -1358,14 +1323,31 @@ def run_dnscan(cfg: dict, profile_name: str,
             if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
                 results.append(ip)
 
-    # Post-filter with SlipNet-like burst sampling to reduce false positives.
-    burst_n = int(cfg.get("scan_burst_count", 10) or 0)
+    # Post-filter with parallel burst sampling to reduce false positives quickly.
+    burst_n = int(cfg.get("scan_burst_count", 6) or 0)
+    burst_to = float(cfg.get("scan_burst_timeout", 0.8) or 0.8)
+    burst_workers = max(1, int(cfg.get("scan_burst_workers", 64) or 64))
+    min_pass = float(cfg.get("scan_burst_min_pass", 0.35) or 0.35)
     if results and burst_n > 0:
         kept = []
+        rates: dict[str, float] = {}
+
+        def _rate(ip):
+            return ip, burst_dns_success(ip, cfg["domain"], timeout=burst_to, count=burst_n)
+
+        with ThreadPoolExecutor(max_workers=min(burst_workers, len(results))) as ex:
+            futs = [ex.submit(_rate, ip) for ip in results]
+            for fut in as_completed(futs):
+                try:
+                    ip, rate = fut.result()
+                    rates[ip] = rate
+                except Exception:
+                    pass
+
         for ip in results:
-            rate = _burst_dns_success(ip, cfg["domain"], timeout=1.2, count=burst_n)
+            rate = rates.get(ip, 0.0)
             update_qps(profile_name, ip, rate)
-            if rate >= 0.4:
+            if rate >= min_pass:
                 kept.append(ip)
             elif progress_cb:
                 progress_cb(f"[burst-filter] reject {ip} ({int(rate*100)}%)")
@@ -2049,9 +2031,11 @@ def _do_scan(profile_name: str, cfg: dict, reason: str,
         if new:
             # Build merged pool: new first, then surviving existing
             existing  = load_servers(profile_name)
-            surviving = [ip for ip in existing
-                         if _dns_latency(ip, cfg["domain"]) < 9999]
-            merged    = list(dict.fromkeys(new + surviving))
+            surviving = surviving_resolvers(
+                existing,
+                lambda ip: _dns_latency(ip, cfg["domain"]) < 9999,
+            )
+            merged    = merge_new_with_existing(new, surviving)
 
             # #5: enforce pool cap
             max_pool = cfg.get("resolver_max_pool", 12)
@@ -2268,6 +2252,7 @@ def start_all(cfg: dict, profile_name: str) -> dict:
     Start tunnel + optional HTTP proxy + optional system proxy + optional watchdog.
     Returns result dict from start_tunnel plus proxy/system/warmup info.
     """
+    _register_proxy_guard()
     result = start_tunnel(cfg, profile_name)
     if result["started"] > 0:
         if cfg.get("enable_http_proxy", True):
@@ -2291,5 +2276,5 @@ def stop_all(cfg: dict):
     if watchdog_running():
         stop_watchdog()
     if cfg.get("enable_http_proxy", True) and cfg.get("system_proxy"):
-        set_system_proxy(False)
+        restore_system_proxy_defaults()
     remove_pid_file()
